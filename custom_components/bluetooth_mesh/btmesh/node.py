@@ -72,6 +72,10 @@ class ReceivedMessage(NamedTuple):
     src: int
     opcode: int
     params: bytes
+    # Where it was sent: our own address for a reply, a group address for
+    # traffic the proxy forwards because we asked it to (see
+    # MeshController.watch_addresses). Defaulted so hand-built messages stay valid.
+    dst: int = 0
 
 
 def _seq_auth(seq: int, seq_zero: int) -> int:
@@ -449,7 +453,9 @@ class MeshNode:
         except AccessError as exc:
             logger.debug("unparseable access payload from %#06x: %s", pdu.src, exc)
             return
-        self._deliver(ReceivedMessage(src=pdu.src, opcode=opcode, params=params))
+        self._deliver(
+            ReceivedMessage(src=pdu.src, opcode=opcode, params=params, dst=pdu.dst)
+        )
 
     def _rx_key(self, akf: bool, aid: int, src: int) -> bytes | None:
         if akf:

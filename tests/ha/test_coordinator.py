@@ -32,6 +32,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bluetooth_mesh import coordinator as coordinator_mod
 from custom_components.bluetooth_mesh.btmesh.fanout import FanoutBearer
+from custom_components.bluetooth_mesh.btmesh.node import ReceivedMessage
 from custom_components.bluetooth_mesh.const import (
     CONF_ALL_PROXIES,
     CONF_CONNECT_JSON,
@@ -329,7 +330,7 @@ async def test_failed_controller_construction_disconnects_the_client(hass) -> No
     """Same guarantee when the controller cannot even be built."""
     entry = _make_entry(hass)
 
-    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key):
+    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key, **_):
         raise ValueError("bad network model")
 
     with _patch_transport(None, ctor_side_effect=ctor) as client:
@@ -377,7 +378,7 @@ async def test_dead_transport_is_never_reused_by_the_next_command(hass) -> None:
     entry = _make_entry(hass)
     built: list[FakeController] = []
 
-    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key):
+    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key, **_):
         built.append(FakeController(seq=seq, tid=tid))
         return built[-1]
 
@@ -519,7 +520,7 @@ async def test_iv_index_is_seeded_from_the_store(hass) -> None:
 
     seen: list[int] = []
 
-    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key):
+    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key, **_):
         seen.append(iv_index)
         return FakeController(seq=seq, tid=tid)
 
@@ -868,7 +869,7 @@ async def test_seq_margin_applied_once_not_per_command(hass) -> None:
 
     ctor_seqs: list[int] = []
 
-    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key):
+    def ctor(network, bearer, *, src_addr, seq, tid, iv_index, app_key, **_):
         ctor_seqs.append(seq)
         assert src_addr == coordinator_mod.SRC_ADDR
         return FakeController(seq=seq, tid=tid)
@@ -2668,4 +2669,35 @@ async def test_lamps_are_re_read_when_a_node_joins_late(hass) -> None:
 
         # Notified once the node is part of the held links, not before.
         assert notified == [[PROXY_ADDR, OTHER_PROXY_ADDR]]
+    await coord.async_stop()
+
+
+async def test_group_traffic_is_watched_and_dispatched(hass) -> None:
+    """A Häfele touch switch publishes to its group and the lamps tell no one;
+    HA kept showing them off while lit (2026-10-04)."""
+    lamp = _lamp(0x000C)
+    lamp["elements"][0]["models"][0]["subscribe"] = ["C014", "C002", "0001"]
+    other = _lamp(0x0010)
+    other["elements"][0]["models"][0]["subscribe"] = ["C002", "C00F"]
+    entry = _entry_for(hass, _doc([lamp, other]))
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord = MeshCoordinator(hass, entry)
+        ctor = coordinator_mod.MeshController
+        heard = []
+        coord.async_add_group_listener(0xC014, lambda: heard.append(0xC014))
+        remove = coord.async_add_group_listener(0xC00F, lambda: heard.append(0xC00F))
+        remove()
+        await coord.async_start()
+        await coord.async_set_onoff(0x000C, True)
+
+        # Every group in the export, unicast subscriptions left out.
+        assert ctor.call_args.kwargs["watch_addresses"] == [0xC002, 0xC00F, 0xC014]
+
+        def message(dst):
+            return ReceivedMessage(src=0x004C, opcode=0x8202, params=b"\x01\x00", dst=dst)
+
+        for dst in (0xC014, 0xC00F, 0xC002):
+            fake.on_group_message(message(dst))
+        assert heard == [0xC014]
     await coord.async_stop()

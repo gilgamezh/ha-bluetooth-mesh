@@ -14,6 +14,7 @@ index; addressing is by element unicast, taken from that same static model.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable
 
 from .access import (
     OP_CONFIG_COMPOSITION_DATA_STATUS,
@@ -67,12 +68,19 @@ from .pump import BearerPump
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MeshController"]
+__all__ = ["GROUP_ADDRESS_MIN", "MeshController"]
 
 # CTL temperature is a 16-bit Kelvin value clamped to the model's valid range
 # (Mesh Model spec §6.1.3.1): 800 K .. 20000 K.
 _CTL_TEMP_MIN = 800
 _CTL_TEMP_MAX = 20000
+
+# Group addresses start here (Mesh Profile §3.4.2.4); 0x8000..0xBFFF are virtual.
+GROUP_ADDRESS_MIN = 0xC000
+
+# A proxy configuration message travels unsegmented: 12 bytes of transport PDU,
+# one of them the opcode, leaves room for five 16-bit addresses per message.
+_FILTER_ADDRESSES_PER_MESSAGE = 5
 
 
 def _full_payload(msg: ReceivedMessage) -> bytes:
@@ -116,6 +124,7 @@ class MeshController:
         tid: int = 0,
         iv_index: int | None = None,
         app_key: bytes | None = None,
+        watch_addresses: Iterable[int] = (),
     ) -> None:
         self._bearer = bearer
         self._pump = BearerPump(bearer, MSG_TYPE_NETWORK_PDU)
@@ -155,6 +164,16 @@ class MeshController:
         # link and reconnect.
         self._pump.on_error = self._on_pump_error
         self._src = src_addr
+        # Group addresses whose traffic the proxy should forward to us as well,
+        # so a change made outside Home Assistant (a wall switch publishing to
+        # its group) is heard. Order kept, duplicates and our own address dropped.
+        self._watch = tuple(
+            dict.fromkeys(a for a in watch_addresses if a != src_addr)
+        )
+        # Called with every access message addressed to a group — the caller
+        # decides what it means. Messages to us go to the waiting requests.
+        self.on_group_message: Callable[[ReceivedMessage], None] | None = None
+        self._node.on_message = self._on_access
         # Proxy address-filter state (see _configure_filter).
         self._filter_status: FilterStatus | None = None
         # The Generic OnOff / Lightness / CTL Set messages carry a TID; the node
@@ -172,6 +191,10 @@ class MeshController:
         await self._bearer.start(self._on_message)
         self._pump.start()
         self._configure_filter()
+
+    def _on_access(self, msg: ReceivedMessage) -> None:
+        if msg.dst >= GROUP_ADDRESS_MIN and self.on_group_message is not None:
+            self.on_group_message(msg)
 
     async def stop(self) -> None:
         """Stop the TX pump and the bearer (reverse of :meth:`start`)."""
@@ -249,10 +272,18 @@ class MeshController:
         Nothing is lost by not waiting: both messages are queued on the ordered
         TX pump ahead of any command, so the filter is in place before the first
         Set reaches the node. A Status is still recorded if one does arrive.
+
+        The watched group addresses go on the same list. Without them a wall
+        switch publishing to its group changed the lamps and Home Assistant
+        never heard of it (2026-10-04): the proxy forwarded nothing but replies.
         """
+        addresses = [self._src, *self._watch]
         try:
             self._send_proxy_config(set_filter_type(FILTER_ACCEPT_LIST))
-            self._send_proxy_config(add_addresses([self._src]))
+            for i in range(0, len(addresses), _FILTER_ADDRESSES_PER_MESSAGE):
+                self._send_proxy_config(
+                    add_addresses(addresses[i:i + _FILTER_ADDRESSES_PER_MESSAGE])
+                )
         except Exception as exc:  # noqa: BLE001 - never fail the connection
             logger.warning("could not configure the proxy filter: %s", exc)
 

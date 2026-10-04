@@ -128,7 +128,9 @@ def test_unsegmented_round_trip_appkey():
     a, b, _ = make_pair()
     a.send_access(0x0002, generic_onoff_set(True, 0x01))
     assert list(b.received) == [
-        ReceivedMessage(src=0x0001, opcode=OP_GENERIC_ONOFF_SET, params=b"\x01\x01")
+        ReceivedMessage(
+            src=0x0001, opcode=OP_GENERIC_ONOFF_SET, params=b"\x01\x01", dst=0x0002
+        )
     ]
 
 
@@ -140,7 +142,7 @@ def test_segmented_round_trip_device_key():
     assert len(a_sent) == 2  # segmented into two network PDUs
     assert list(b.received) == [
         ReceivedMessage(
-            src=0x0001, opcode=OP_CONFIG_APPKEY_ADD, params=payload[1:]
+            src=0x0001, opcode=OP_CONFIG_APPKEY_ADD, params=payload[1:], dst=0x0002
         )
     ]
 
@@ -151,7 +153,9 @@ def test_on_message_callback_fires():
     b.on_message = seen.append
     a.send_access(0x0002, generic_onoff_set(False, 0x02))
     assert seen == [
-        ReceivedMessage(src=0x0001, opcode=OP_GENERIC_ONOFF_SET, params=b"\x00\x02")
+        ReceivedMessage(
+            src=0x0001, opcode=OP_GENERIC_ONOFF_SET, params=b"\x00\x02", dst=0x0002
+        )
     ]
 
 
@@ -183,7 +187,7 @@ async def test_request_success():
         0x0002, generic_onoff_set(True, 0x03), OP_GENERIC_ONOFF_STATUS
     )
     assert msg == ReceivedMessage(
-        src=0x0002, opcode=OP_GENERIC_ONOFF_STATUS, params=b"\x01"
+        src=0x0002, opcode=OP_GENERIC_ONOFF_STATUS, params=b"\x01", dst=0x0001
     )
     assert len(a_sent) == 1  # no retransmission needed
 
@@ -261,7 +265,10 @@ async def test_request_with_device_key():
         OP_CONFIG_APPKEY_STATUS, dev_key=True,
     )
     assert msg == ReceivedMessage(
-        src=0x0002, opcode=OP_CONFIG_APPKEY_STATUS, params=bytes.fromhex("00563412")
+        src=0x0002,
+        opcode=OP_CONFIG_APPKEY_STATUS,
+        params=bytes.fromhex("00563412"),
+        dst=0x0001,
     )
     assert len(a_sent) == 2  # the request itself went out as two segments
 

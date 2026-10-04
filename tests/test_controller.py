@@ -34,6 +34,7 @@ from btmesh.access import (
     OP_LIGHT_LIGHTNESS_SET_UNACK,
     OP_LIGHT_LIGHTNESS_STATUS,
     encode_opcode,
+    generic_onoff_set,
 )
 from btmesh.beacon import build_secure_network_beacon
 from btmesh.controller import MeshController
@@ -114,7 +115,12 @@ class FakeBearer:
         self.on_message(msg_type, pdu)
 
 
-def make_setup(tid: int = 0, fade: bool = False, range_status: int = 0x00):
+def make_setup(
+    tid: int = 0,
+    fade: bool = False,
+    range_status: int = 0x00,
+    watch_addresses=(),
+):
     """Build a started controller wired to a device node through a FakeBearer.
 
     Returns ``(controller, bearer, captured)`` where ``captured`` is the list of
@@ -128,7 +134,9 @@ def make_setup(tid: int = 0, fade: bool = False, range_status: int = 0x00):
     """
     network = Network.from_connect_file(FIXTURE)
     bearer = FakeBearer()
-    controller = MeshController(network, bearer, tid=tid)
+    controller = MeshController(
+        network, bearer, tid=tid, watch_addresses=watch_addresses
+    )
 
     captured: list[ReceivedMessage] = []
 
@@ -575,6 +583,48 @@ async def test_proxy_filter_messages_travel_as_proxy_config_pdus():
     try:
         types = [msg_type for msg_type, _ in bearer.sent]
         assert types == [MSG_TYPE_PROXY_CONFIG, MSG_TYPE_PROXY_CONFIG]
+    finally:
+        await controller.stop()
+
+
+async def test_watched_groups_join_the_proxy_filter_five_per_message():
+    """A wall switch publishes to its group; the proxy forwards it only if asked.
+
+    An unsegmented proxy-config message has room for five addresses, so a
+    longer list is split. Our own address stays first and is not repeated.
+    """
+    groups = [0xC002, 0xC006, 0xC00A, 0xC00F, 0xC014, 0xC019]
+    controller, bearer, _ = make_setup(watch_addresses=[0x7FFF, *groups, 0xC014])
+    await controller.start()
+    await _drain_proxy_config(bearer, 3)
+    try:
+        def add(*addresses):
+            return bytes([OP_ADD_ADDRESSES]) + b"".join(
+                a.to_bytes(2, "big") for a in addresses
+            )
+
+        assert bearer.proxy_config == [
+            bytes([OP_SET_FILTER_TYPE, FILTER_ACCEPT_LIST]),
+            add(0x7FFF, *groups[:4]),
+            add(*groups[4:]),
+        ]
+    finally:
+        await controller.stop()
+
+
+async def test_traffic_to_a_group_is_handed_to_the_caller():
+    """What the Häfele touch switch sends: an OnOff Set to its group."""
+    controller, bearer, _ = make_setup(watch_addresses=[0xC014])
+    heard: list[ReceivedMessage] = []
+    controller.on_group_message = heard.append
+    await controller.start()
+    try:
+        bearer.device.send_access(0xC014, generic_onoff_set(True, 0x07))
+        # A reply addressed to us is not group traffic.
+        assert await controller.get_onoff(UNICAST, timeout=1.0) is True
+        assert [(m.src, m.dst, m.opcode) for m in heard] == [
+            (UNICAST, 0xC014, OP_GENERIC_ONOFF_SET)
+        ]
     finally:
         await controller.stop()
 

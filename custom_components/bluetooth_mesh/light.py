@@ -41,8 +41,10 @@ from homeassistant.components.light import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 from . import BluetoothMeshConfigEntry
+from .btmesh.controller import GROUP_ADDRESS_MIN
 from .const import (
     CONF_INVERTED_CTL,
     DOMAIN,
@@ -64,6 +66,11 @@ HA_BRIGHTNESS_MAX = 255
 # a safe default rather than the raw model limits.
 DEFAULT_MIN_KELVIN = 2700
 DEFAULT_MAX_KELVIN = 6500
+
+# How long after the last command someone else sent to one of our groups the
+# lamp is re-read. Long enough for a default transition to settle, and re-armed
+# by every message, so holding a wall switch to dim reads once, after release.
+GROUP_REREAD_DELAY = 2.0
 
 # Known company identifiers → friendly manufacturer names. Unknown CIDs fall
 # back to the raw hex (see ``_manufacturer``).
@@ -329,6 +336,20 @@ class MeshLight(LightEntity):
         # property of the device, not a state.
         self._range_read = False
         self._refresh_task: asyncio.Task | None = None
+        # Groups this output listens on (as the export says), and the pending
+        # re-read after someone else commanded one of them.
+        self._groups = tuple(
+            sorted(
+                {
+                    address
+                    for el in (node.elements if element is None else (element,))
+                    for model in el.models
+                    for address in model.subscribe
+                    if address >= GROUP_ADDRESS_MIN
+                }
+            )
+        )
+        self._reread_unsub: Callable[[], None] | None = None
         # Group entities over this output, re-rendered whenever it changes.
         self._state_listeners: list[Callable[[], None]] = []
 
@@ -348,8 +369,41 @@ class MeshLight(LightEntity):
         self.async_on_remove(
             self._coordinator.async_add_listener(self._handle_availability)
         )
+        for address in self._groups:
+            self.async_on_remove(
+                self._coordinator.async_add_group_listener(
+                    address, self._handle_group_message
+                )
+            )
         if self._coordinator.available:
             self._schedule_refresh()
+
+    @callback
+    def _handle_group_message(self) -> None:
+        """Someone else commanded one of our groups: re-read once it settles.
+
+        A wall switch (or the vendor app) switched or dimmed the lamp, and the
+        lamp tells no one. Before this, HA kept showing the old state until the
+        next restart (2026-10-04).
+        """
+        self._cancel_reread()
+        self._reread_unsub = async_call_later(
+            self.hass, GROUP_REREAD_DELAY, self._reread_callback
+        )
+
+    @callback
+    def _reread_callback(self, _now) -> None:
+        self._reread_unsub = None
+        if self._refresh_task is not None and not self._refresh_task.done():
+            # A read already under way may have asked before the change landed.
+            self._handle_group_message()
+            return
+        self._schedule_refresh()
+
+    def _cancel_reread(self) -> None:
+        if self._reread_unsub is not None:
+            self._reread_unsub()
+            self._reread_unsub = None
 
     @callback
     def _write_state(self) -> None:
@@ -402,6 +456,7 @@ class MeshLight(LightEntity):
         entry reloads carried on against the coordinator that had just been
         stopped.
         """
+        self._cancel_reread()
         if self._refresh_task is not None:
             self._refresh_task.cancel()
             self._refresh_task = None

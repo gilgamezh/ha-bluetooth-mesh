@@ -44,7 +44,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 
-from .btmesh.controller import MeshController
+from .btmesh.controller import GROUP_ADDRESS_MIN, MeshController
 from .btmesh.crypto import k3
 from .btmesh.fanout import FanoutBearer
 from .btmesh.network_model import UNICAST_MAX, UNICAST_MIN, Network
@@ -297,6 +297,9 @@ class MeshCoordinator:
         self._discovery_unsub: CALLBACK_TYPE | None = None
         # Entities subscribed to availability transitions (see async_add_listener).
         self._listeners: list[CALLBACK_TYPE] = []
+        # Entities interested in traffic to a group address, by address (see
+        # async_add_group_listener).
+        self._group_listeners: dict[int, list[CALLBACK_TYPE]] = {}
         # The HELD proxy connection (keep-alive): reused across commands and
         # dropped after _idle_timeout seconds of inactivity (0 = never drop).
         # None while disconnected.
@@ -435,6 +438,56 @@ class MeshCoordinator:
                 self._listeners.remove(update_callback)
 
         return _remove
+
+    @callback
+    def async_add_group_listener(
+        self, address: int, update_callback: CALLBACK_TYPE
+    ) -> CALLBACK_TYPE:
+        """Call ``update_callback`` whenever someone else commands ``address``.
+
+        A wall switch publishes to its group and the lamps act on it without
+        ever telling us; the proxy forwards that publish only because the
+        controller watches every group a light listens on. What the lamps did
+        is not in the message (a Level Move says "start dimming", not where it
+        stopped), so listeners re-read rather than decode it.
+        """
+        listeners = self._group_listeners.setdefault(address, [])
+        listeners.append(update_callback)
+
+        def _remove() -> None:
+            if update_callback in listeners:
+                listeners.remove(update_callback)
+
+        return _remove
+
+    def _watched_groups(self) -> list[int]:
+        """Every group address a model in the export subscribes to.
+
+        Read from the export, not from the listeners: the link can come up
+        before the lights have registered, and the filter is set only then.
+        """
+        return sorted(
+            {
+                address
+                for node in self._network.nodes
+                for element in node.elements
+                for model in element.models
+                for address in model.subscribe
+                if address >= GROUP_ADDRESS_MIN
+            }
+        )
+
+    @callback
+    def _on_group_message(self, msg) -> None:
+        """A message to a group arrived (our own were dropped as self-echo)."""
+        logger.debug(
+            "group %#06x: opcode %#06x from %#06x", msg.dst, msg.opcode, msg.src
+        )
+        for update_callback in list(self._group_listeners.get(msg.dst, ())):
+            try:
+                update_callback()
+            except Exception:  # noqa: BLE001
+                logger.exception("group listener raised")
 
     def _notify_listeners(self) -> None:
         """Fire every listener; one raising must not starve the others."""
@@ -923,7 +976,9 @@ class MeshCoordinator:
                     self._network, bearer, src_addr=self._src_addr,
                     seq=self._seq, tid=self._tid, iv_index=self._iv_index,
                     app_key=self._app_key.key,
+                    watch_addresses=self._watched_groups(),
                 )
+                controller.on_group_message = self._on_group_message
                 await controller.start()
         except Exception as exc:  # noqa: BLE001 - transport/GATT/connect
             self._link_by_bearer = {}

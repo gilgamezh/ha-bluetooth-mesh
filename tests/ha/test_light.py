@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,8 @@ pytest.importorskip("homeassistant")
 pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.components.light import ColorMode
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.bluetooth_mesh.btmesh.network_model import (
     Element,
@@ -72,6 +75,7 @@ class FakeCoordinator:
         # Whether a group Set can leave (False = no link to send it on).
         self.group_link = True
         self.listeners: list = []
+        self.group_listeners: dict[int, list] = {}
 
     def async_add_listener(self, callback_):
         """Mirror the real coordinator: notified on availability changes."""
@@ -80,6 +84,15 @@ class FakeCoordinator:
 
     def fire(self) -> None:
         for callback_ in list(self.listeners):
+            callback_()
+
+    def async_add_group_listener(self, address: int, callback_):
+        """Mirror the real coordinator: notified of others' traffic to a group."""
+        self.group_listeners.setdefault(address, []).append(callback_)
+        return lambda: self.group_listeners[address].remove(callback_)
+
+    def fire_group(self, address: int) -> None:
+        for callback_ in list(self.group_listeners.get(address, ())):
             callback_()
 
     async def async_set_onoff(self, unicast: int, on: bool) -> bool:
@@ -425,6 +438,58 @@ async def test_refreshes_when_the_mesh_becomes_reachable(hass) -> None:
     assert ("get_onoff", UNICAST) in coordinator.calls
     assert light.is_on is True
     assert light.brightness == 128
+
+
+def _grouped_network() -> Network:
+    """A one-node network whose lamp subscribes to two groups and a unicast."""
+    element0 = Element(
+        index=0,
+        unicast=0x0020,
+        models=(
+            Model(
+                model_id=0x1000,
+                bound_appkey_indexes=(0,),
+                subscribe=(0xC014, 0xC002, 0x0005),
+            ),
+        ),
+    )
+    node = Node(
+        uuid="11112222-3333-4444-5555-666677778888",
+        unicast=0x0020,
+        device_key=b"\x00" * 16,
+        cid=0x07E9,
+        name="Grouped",
+        elements=(element0,),
+    )
+    return replace(_fixture_network(), nodes=(node,))
+
+
+async def test_a_wall_switch_on_the_group_makes_the_lamp_re_read(hass) -> None:
+    """The Häfele touch switch publishes to its group and the lamp tells no
+    one; HA kept showing it off while it was lit (2026-10-04)."""
+    light, coordinator = _light(_grouped_network(), 0x0020)
+    light.hass = hass
+    light.entity_id = "light.mesh_test"
+    coordinator.onoff = False
+    await light.async_added_to_hass()
+    await hass.async_block_till_done()
+    assert sorted(coordinator.group_listeners) == [0xC002, 0xC014]
+    assert light.is_on is False
+    coordinator.calls.clear()
+
+    coordinator.onoff = True  # someone pressed the switch
+    coordinator.fire_group(0xC014)
+    # A press-and-hold sends more; they collapse into one read once it settles.
+    coordinator.fire_group(0xC014)
+    await hass.async_block_till_done()
+    assert coordinator.calls == []
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=3))
+    await hass.async_block_till_done()
+    assert coordinator.calls.count(("get_onoff", 0x0020)) == 1
+    assert light.is_on is True
+
+    await light.async_will_remove_from_hass()
 
 
 async def test_availability_change_is_pushed_not_polled(hass) -> None:
