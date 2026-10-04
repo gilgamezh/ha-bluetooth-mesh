@@ -2669,3 +2669,23 @@ async def test_lamps_are_re_read_when_a_node_joins_late(hass) -> None:
         # Notified once the node is part of the held links, not before.
         assert notified == [[PROXY_ADDR, OTHER_PROXY_ADDR]]
     await coord.async_stop()
+
+
+async def test_a_lamps_status_reaches_its_listeners_only(hass) -> None:
+    """Routed by the element that sent it (2026-10-04: wall switch unheard)."""
+    entry = _make_entry(hass)
+    fake = FakeController()
+    with _patch_transport(fake):
+        coord = MeshCoordinator(hass, entry)
+        heard = []
+        coord.async_add_status_listener(UNICAST, lambda *a: heard.append(a))
+        remove = coord.async_add_status_listener(0x0099, lambda *a: heard.append(a))
+        remove()
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+
+        fake.on_status(UNICAST, False, None)
+        fake.on_status(0x0099, True, None)
+        fake.on_status(UNICAST, None, 0x4000)
+        assert heard == [(False, None), (None, 0x4000)]
+    await coord.async_stop()

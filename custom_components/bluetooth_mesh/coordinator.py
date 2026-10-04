@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from time import monotonic
 
@@ -297,6 +298,9 @@ class MeshCoordinator:
         self._discovery_unsub: CALLBACK_TYPE | None = None
         # Entities subscribed to availability transitions (see async_add_listener).
         self._listeners: list[CALLBACK_TYPE] = []
+        # Lights told what their lamp reported, by element address (see
+        # async_add_status_listener).
+        self._status_listeners: dict[int, list[Callable]] = {}
         # The HELD proxy connection (keep-alive): reused across commands and
         # dropped after _idle_timeout seconds of inactivity (0 = never drop).
         # None while disconnected.
@@ -435,6 +439,34 @@ class MeshCoordinator:
                 self._listeners.remove(update_callback)
 
         return _remove
+
+    @callback
+    def async_add_status_listener(
+        self, unicast: int, update_callback: Callable[[bool | None, int | None], None]
+    ) -> CALLBACK_TYPE:
+        """Call ``update_callback(onoff, lightness)`` for each Status ``unicast`` sends.
+
+        Replies to our own reads and Sets arrive here too, and so does a Status
+        the lamp publishes by itself after a change made at the device (a wired
+        wall switch) -- the only way that change is ever heard, and only once
+        the lamp's server has a publish address (see phase0/hafele_publish.py).
+        """
+        listeners = self._status_listeners.setdefault(unicast, [])
+        listeners.append(update_callback)
+
+        def _remove() -> None:
+            if update_callback in listeners:
+                listeners.remove(update_callback)
+
+        return _remove
+
+    @callback
+    def _on_status(self, src: int, onoff: bool | None, lightness: int | None) -> None:
+        for update_callback in list(self._status_listeners.get(src, ())):
+            try:
+                update_callback(onoff, lightness)
+            except Exception:  # noqa: BLE001
+                logger.exception("status listener raised")
 
     def _notify_listeners(self) -> None:
         """Fire every listener; one raising must not starve the others."""
@@ -924,6 +956,7 @@ class MeshCoordinator:
                     seq=self._seq, tid=self._tid, iv_index=self._iv_index,
                     app_key=self._app_key.key,
                 )
+                controller.on_status = self._on_status
                 await controller.start()
         except Exception as exc:  # noqa: BLE001 - transport/GATT/connect
             self._link_by_bearer = {}
