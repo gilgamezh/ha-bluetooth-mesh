@@ -86,6 +86,9 @@ class Model:
     # empty tuple means "no group has this model on its member list", not
     # "unread".
     subscribe: tuple[int, ...] = ()
+    # Where this model publishes, per the export (spec §4.2.2): a wall switch's
+    # OnOff/Level client names the group it drives here. ``None`` when unset.
+    publish: int | None = None
 
     @property
     def is_vendor(self) -> bool:
@@ -513,8 +516,15 @@ def _parse_model(raw: dict) -> Model:
     if not isinstance(subscribe, list):
         raise NetworkModelError(f"'subscribe' must be a list, got {subscribe!r}")
     addresses = tuple(_hex_int(a, "models[].subscribe[]") for a in subscribe)
+    publish = raw.get("publish")
+    publish_address = None
+    if isinstance(publish, dict) and publish.get("address") is not None:
+        publish_address = _hex_int(publish["address"], "models[].publish.address")
     return Model(
-        model_id=model_id, bound_appkey_indexes=indexes, subscribe=addresses
+        model_id=model_id,
+        bound_appkey_indexes=indexes,
+        subscribe=addresses,
+        publish=publish_address,
     )
 
 

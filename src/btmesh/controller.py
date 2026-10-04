@@ -278,6 +278,9 @@ class MeshController:
         never heard of it (2026-10-04): the proxy forwarded nothing but replies.
         """
         addresses = [self._src, *self._watch]
+        logger.debug(
+            "proxy filter: accepting %s", ", ".join(f"{a:#06x}" for a in addresses)
+        )
         try:
             self._send_proxy_config(set_filter_type(FILTER_ACCEPT_LIST))
             for i in range(0, len(addresses), _FILTER_ADDRESSES_PER_MESSAGE):

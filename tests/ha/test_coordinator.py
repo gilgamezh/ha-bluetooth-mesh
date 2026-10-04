@@ -2679,6 +2679,10 @@ async def test_group_traffic_is_watched_and_dispatched(hass) -> None:
     lamp["elements"][0]["models"][0]["subscribe"] = ["C014", "C002", "0001"]
     other = _lamp(0x0010)
     other["elements"][0]["models"][0]["subscribe"] = ["C002", "C00F"]
+    # A wall switch's client publishing to its group (ThingOS "Sensore").
+    other["elements"].append(
+        {"index": 1, "models": [{"modelId": "1001", "bind": [0], "publish": {"address": "C00F", "ttl": 255}}]}
+    )
     entry = _entry_for(hass, _doc([lamp, other]))
     fake = FakeController()
     with _patch_transport(fake):
@@ -2691,8 +2695,9 @@ async def test_group_traffic_is_watched_and_dispatched(hass) -> None:
         await coord.async_start()
         await coord.async_set_onoff(0x000C, True)
 
-        # Every group in the export, unicast subscriptions left out.
-        assert ctor.call_args.kwargs["watch_addresses"] == [0xC002, 0xC00F, 0xC014]
+        # Every group in the export, unicast subscriptions left out, and the
+        # one a switch drives first: a full proxy filter drops the tail.
+        assert ctor.call_args.kwargs["watch_addresses"] == [0xC00F, 0xC002, 0xC014]
 
         def message(dst):
             return ReceivedMessage(src=0x004C, opcode=0x8202, params=b"\x01\x00", dst=dst)

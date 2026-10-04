@@ -465,17 +465,27 @@ class MeshCoordinator:
 
         Read from the export, not from the listeners: the link can come up
         before the lights have registered, and the filter is set only then.
+
+        Groups some model PUBLISHES to come first. Those are the ones a wall
+        switch drives, the traffic this exists to hear; the rest (rooms, "all")
+        only carry what the vendor app or we send. A proxy's accept list is
+        finite and one that is full drops further additions in silence, so
+        the order decides what survives.
         """
-        return sorted(
-            {
-                address
-                for node in self._network.nodes
-                for element in node.elements
-                for model in element.models
-                for address in model.subscribe
-                if address >= GROUP_ADDRESS_MIN
-            }
-        )
+        models = [
+            model
+            for node in self._network.nodes
+            for element in node.elements
+            for model in element.models
+        ]
+        subscribed = {
+            address
+            for model in models
+            for address in model.subscribe
+            if address >= GROUP_ADDRESS_MIN
+        }
+        published = {model.publish for model in models} & subscribed
+        return sorted(published) + sorted(subscribed - published)
 
     @callback
     def _on_group_message(self, msg) -> None:
