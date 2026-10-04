@@ -722,6 +722,14 @@ class MeshCoordinator:
                 self._seq = controller.seq
                 self._persist()
                 logger.info("mesh proxy %s joined the held links", address)
+                # Lamps behind a node that joins late were never read: the
+                # reads ran when the first link came up, and this node's
+                # answers could not reach us then. Seen on hardware 2026-10-04:
+                # a box rejoined after a restart, its lamps stayed "unknown",
+                # an unacknowledged group Off then showed them off while they
+                # were lit, and the dashboard's Off did nothing. Listeners are
+                # the lights; on this they re-read (one read in flight each).
+                self._notify_listeners()
         finally:
             self._joining.discard(address)
 

@@ -2648,3 +2648,24 @@ async def test_a_slow_late_join_does_not_hold_up_commands(hass) -> None:
         await _wait_for(lambda: OTHER_PROXY_ADDR in coord.proxy_addresses)
         assert OTHER_PROXY_ADDR in clients
     await coord.async_stop()
+
+
+async def test_lamps_are_re_read_when_a_node_joins_late(hass) -> None:
+    """A late node's lamps were never read; HA then trusted unacknowledged
+    group Sets for them and showed lit lamps as off (2026-10-04)."""
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    with _patch_islands(fake, []):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+        await _started_fanout(coord)
+        notified = []
+        coord.async_add_listener(lambda: notified.append(coord.proxy_addresses[:]))
+
+        coord._on_proxy_seen(OTHER_PROXY_ADDR)
+        await _wait_for(lambda: notified)
+
+        # Notified once the node is part of the held links, not before.
+        assert notified == [[PROXY_ADDR, OTHER_PROXY_ADDR]]
+    await coord.async_stop()
