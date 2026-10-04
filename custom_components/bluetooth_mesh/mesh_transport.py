@@ -151,6 +151,7 @@ def find_proxy_addresses(
     *,
     max_age: float | None = PROXY_ADVERT_MAX_AGE,
     exclude: Collection[str] = (),
+    strongest_first: bool = False,
 ) -> list[str]:
     """Every connectable mesh proxy advertising ``net_key``'s Network ID.
 
@@ -181,10 +182,14 @@ def find_proxy_addresses(
     ``exclude`` drops addresses the caller already holds a link to: a held
     node stops advertising, but its last advert stays in the snapshot for up
     to ``max_age``, and a second connect to it can only be refused.
+
+    ``strongest_first`` orders the result by advert RSSI, strongest first, for
+    a caller that keeps only some of them: every powered lamp is a proxy node,
+    and the ones kept should be the ones most likely to hold a link.
     """
     network_id = k3(net_key)
     now = monotonic()
-    found: list[str] = []
+    found: list[tuple[str, int]] = []
     for info in bluetooth.async_discovered_service_info(hass, connectable=False):
         if info.address in exclude or not _matches_network_id(info, network_id):
             continue
@@ -201,14 +206,17 @@ def find_proxy_addresses(
                 "mesh proxy %s advertises Network ID %s (connectable)",
                 info.address, network_id.hex(),
             )
-            found.append(info.address)
+            rssi = getattr(info, "rssi", None)
+            found.append((info.address, rssi if isinstance(rssi, int) else -127))
             continue
         logger.debug(
             "mesh proxy %s advertises Network ID %s but only via a "
             "non-connectable scanner; skipping",
             info.address, network_id.hex(),
         )
-    return found
+    if strongest_first:
+        found.sort(key=lambda match: -match[1])
+    return [address for address, _ in found]
 
 
 def discovered_proxies(hass: HomeAssistant) -> list[tuple[str, str]]:

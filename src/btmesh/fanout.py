@@ -49,7 +49,15 @@ class FanoutBearer:
             raise ValueError("FanoutBearer needs at least one bearer")
         self._bearers = list(bearers)
         self._last_error: BaseException | None = None
+        # Set once a send reached no child at all: the fan-out is dead even
+        # though the children are kept for the owner's teardown to free.
+        self._dead = False
         self._on_message: Callable[[int, bytes], None] | None = None
+        # Told about every child this object stops using, so the owner can free
+        # what the child holds. A dropped child is still connected: left alone
+        # it kept its node's only proxy slot, and the owner, still counting it
+        # as linked, never tried that node again (review of #49).
+        self.on_drop: Callable[[Any], None] | None = None
 
     @property
     def bearers(self) -> list[Any]:
@@ -74,12 +82,25 @@ class FanoutBearer:
         grace period, see ``GattBearer.failure``) no longer receives, so it is
         not counted as usable even though writes to it may still succeed.
         """
-        if self._live():
+        if self._live() and not self._dead:
             return None
         return self._last_error or BearerError("every proxy link has failed")
 
     def _live(self) -> list[Any]:
         return [b for b in self._bearers if getattr(b, "failure", None) is None]
+
+    def _drop(self, dropped: list[Any]) -> None:
+        """Stop using ``dropped`` and tell :attr:`on_drop` about each one."""
+        if not dropped:
+            return
+        self._bearers = [b for b in self._bearers if b not in dropped]
+        if self.on_drop is None:
+            return
+        for bearer in dropped:
+            try:
+                self.on_drop(bearer)
+            except Exception:  # noqa: BLE001 - the owner's cleanup, not ours
+                logger.exception("on_drop failed for a proxy link")
 
     async def start(self, on_message: Callable[[int, bytes], None]) -> None:
         """Subscribe every child, dropping those that cannot subscribe.
@@ -88,18 +109,17 @@ class FanoutBearer:
         delivers nothing, but the others still reach their own islands.
         """
         self._on_message = on_message
-        started = []
+        failed = []
         for bearer in self._bearers:
             try:
                 await bearer.start(on_message)
             except Exception as exc:  # noqa: BLE001 - one island, not all
                 self._last_error = exc
                 logger.warning("dropping a proxy link that failed to start: %s", exc)
-                continue
-            started.append(bearer)
-        if not started:
+                failed.append(bearer)
+        if len(failed) == len(self._bearers):
             raise BearerError(f"no proxy link could start: {self._last_error}")
-        self._bearers = started
+        self._drop(failed)
 
     async def add(self, bearer: Any) -> None:
         """Start ``bearer`` and send through it too from now on.
@@ -136,6 +156,9 @@ class FanoutBearer:
         messages' SAR frames on one link. A child whose write fails is dropped;
         the send raises only if it reached no child at all.
         """
+        # A child whose subscribe failed late receives nothing any more; let
+        # its owner free it now rather than leave it holding the slot.
+        self._drop([b for b in self._bearers if getattr(b, "failure", None) is not None])
         live = self._live()
         if not live:
             raise BearerError(f"every proxy link has failed: {self._last_error}")
@@ -149,7 +172,10 @@ class FanoutBearer:
                 self._last_error = result
                 failed.append(bearer)
                 logger.warning("dropping a proxy link whose write failed: %s", result)
-        if failed:
-            self._bearers = [b for b in self._bearers if b not in failed]
         if len(failed) == len(live):
+            # Kept, not dropped: with nothing left the whole fan-out has
+            # failed, and the owner tears every link down through its usual
+            # dead-link path rather than one at a time.
+            self._dead = True
             raise BearerError(f"every proxy link has failed: {self._last_error}")
+        self._drop(failed)

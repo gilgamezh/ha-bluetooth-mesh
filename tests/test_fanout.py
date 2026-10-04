@@ -210,3 +210,48 @@ async def test_refresh_proxy_filter_claims_the_filter_on_every_link():
         assert len(a.sent) == 4
     finally:
         await controller.stop()
+
+
+async def test_a_dropped_link_is_reported_so_its_owner_can_free_it():
+    """Left connected, a dropped link kept its node's only slot (review of #49)."""
+    good, bad_write, bad_start = FakeBearer(), FakeBearer(fail_send=True), FakeBearer(fail_start=True)
+    dropped = []
+    fanout = FanoutBearer([good, bad_write, bad_start])
+    fanout.on_drop = dropped.append
+
+    await fanout.start(lambda *_: None)
+    assert dropped == [bad_start]
+
+    await fanout.send(MSG_TYPE_NETWORK_PDU, b"\x01")
+    assert dropped == [bad_start, bad_write]
+    assert fanout.bearers == [good]
+
+
+async def test_a_link_whose_subscribe_failed_late_is_reported_on_the_next_send():
+    a, b = FakeBearer(), FakeBearer()
+    dropped = []
+    fanout = FanoutBearer([a, b])
+    fanout.on_drop = dropped.append
+    await fanout.start(lambda *_: None)
+
+    a.failure = BearerError("late subscribe failure")
+    await fanout.send(MSG_TYPE_NETWORK_PDU, b"\x01")
+
+    assert dropped == [a]
+    assert fanout.bearers == [b]
+
+
+async def test_total_failure_keeps_the_links_for_the_owners_teardown():
+    """Nothing is reported one by one when no link is left: the owner's
+    dead-link path tears them all down at once."""
+    a, b = FakeBearer(fail_send=True), FakeBearer(fail_send=True)
+    dropped = []
+    fanout = FanoutBearer([a, b])
+    fanout.on_drop = dropped.append
+    await fanout.start(lambda *_: None)
+
+    with pytest.raises(BearerError):
+        await fanout.send(MSG_TYPE_NETWORK_PDU, b"\x01")
+
+    assert dropped == []
+    assert fanout.failure is not None

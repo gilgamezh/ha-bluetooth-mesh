@@ -2420,3 +2420,231 @@ async def test_a_node_never_announced_again_is_found_on_the_snapshot(hass) -> No
         assert coord._controller is fake
     await coord.async_stop()
     assert coord._late_look_unsub is None
+
+
+# ------------------------------------------------- review of #49
+
+
+async def test_late_join_persists_the_seq_its_filter_claim_spent(hass) -> None:
+    """Left in the controller, the next reconnect reused those SEQ numbers for
+    its own filter setup and the nodes dropped it as a replay (item 1)."""
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    with _patch_islands(fake, []):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+        await _started_fanout(coord)
+
+        def claim() -> None:
+            fake.seq += 2  # set filter type + add address
+        fake.refresh_proxy_filter.side_effect = claim
+        before = fake.seq
+
+        coord._on_proxy_seen(OTHER_PROXY_ADDR)
+        await _wait_for(lambda: OTHER_PROXY_ADDR in coord.proxy_addresses)
+
+        assert fake.seq == before + 2
+        assert coord._seq == fake.seq
+        await coord._flush_state()
+        stored = await coord._store.async_load()
+        assert stored["seq"] == fake.seq
+    await coord.async_stop()
+
+
+class _SlowStartController(FakeController):
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self._delay = delay
+
+    async def start(self) -> None:
+        await asyncio.sleep(self._delay)
+        await super().start()
+
+
+async def test_option_off_keeps_one_budget_for_connect_and_start(hass) -> None:
+    """Connect and controller start share one CONNECT_TIMEOUT, as before the
+    option existed; two separate budgets doubled the worst case (item 2)."""
+    entry = _make_entry(hass)
+    fake = _SlowStartController(0.2)
+
+    async def slow_connect(*_args, **_kwargs):
+        await asyncio.sleep(0.2)
+        client = MagicMock()
+        client.disconnect = AsyncMock()
+        return client, MagicMock()
+
+    with (
+        _patch_transport(fake),
+        patch.object(coordinator_mod, "CONNECT_TIMEOUT", 0.3),
+        patch.object(
+            coordinator_mod, "async_connect_bearer", new=AsyncMock(side_effect=slow_connect)
+        ),
+    ):
+        coord = MeshCoordinator(hass, entry)
+        coord._stopped = False
+        async with coord._lock:
+            controller = await coord._ensure_connected()
+
+        assert controller is None  # 0.2 s + 0.2 s does not fit one 0.3 s budget
+    await coord.async_stop()
+
+
+async def test_extra_links_do_not_eat_the_main_links_budget(hass) -> None:
+    """With the option on the main budget is paused while extras connect."""
+    entry = _all_proxies_entry(hass)
+    fake = _SlowStartController(0.1)
+
+    async def connect(_hass, address, **_kwargs):
+        await asyncio.sleep(0.15)
+        client = MagicMock()
+        client.disconnect = AsyncMock()
+        bearer = MagicMock()
+        bearer.start = AsyncMock()
+        bearer.failure = None
+        return client, bearer
+
+    with (
+        _patch_islands(fake, [OTHER_PROXY_ADDR]),
+        patch.object(coordinator_mod, "CONNECT_TIMEOUT", 0.3),
+        patch.object(
+            coordinator_mod, "async_connect_bearer", new=AsyncMock(side_effect=connect)
+        ),
+    ):
+        coord = MeshCoordinator(hass, entry)
+        coord._stopped = False
+        async with coord._lock:
+            controller = await coord._ensure_connected()
+
+        # main 0.15 + start 0.1 fits 0.3; the extra's 0.15 is not charged to it
+        assert controller is fake
+        assert coord.proxy_addresses == [PROXY_ADDR, OTHER_PROXY_ADDR]
+    await coord.async_stop()
+
+
+async def test_a_dropped_link_is_disconnected_and_can_join_again(hass) -> None:
+    """A link the fan-out stops using must not keep its node's slot (item 3)."""
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    with _patch_islands(fake, [OTHER_PROXY_ADDR]) as (clients, _, _):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+        fanout = await _started_fanout(coord)
+        other_bearer = fanout.bearers[1]
+
+        coord._on_link_dropped(other_bearer)
+        await hass.async_block_till_done()
+
+        clients[OTHER_PROXY_ADDR].disconnect.assert_awaited()
+        assert coord.proxy_addresses == [PROXY_ADDR]
+        assert coord._extra_clients == []
+        assert OTHER_PROXY_ADDR in coord._late_link_attempts  # retried later
+        assert coord._controller is fake  # the main link carries on
+    await coord.async_stop()
+
+
+async def test_a_dropped_main_link_hands_its_role_to_the_next(hass) -> None:
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    with _patch_islands(fake, [OTHER_PROXY_ADDR]) as (clients, _, _):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+        fanout = await _started_fanout(coord)
+
+        coord._on_link_dropped(fanout.bearers[0])
+        await hass.async_block_till_done()
+
+        clients[PROXY_ADDR].disconnect.assert_awaited()
+        assert coord._client is clients[OTHER_PROXY_ADDR]
+        assert coord.proxy_address == OTHER_PROXY_ADDR
+        assert coord.proxy_addresses == [OTHER_PROXY_ADDR]
+    await coord.async_stop()
+
+
+async def test_extra_links_are_capped_and_strongest_first(hass) -> None:
+    """Every powered lamp is a proxy node (item 4)."""
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    many = [f"C3:EB:49:65:67:{n:02X}" for n in range(6)]
+    with _patch_islands(fake, many) as (clients, _, find_all):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+
+        assert find_all.call_args.kwargs["strongest_first"] is True
+        assert list(clients) == [PROXY_ADDR, *many[: coordinator_mod.MAX_EXTRA_LINKS]]
+    await coord.async_stop()
+
+
+async def test_extra_links_connect_at_the_same_time(hass) -> None:
+    """One after the other, many lamps held the lock a timeout each (item 4).
+
+    Every connect waits until all have started: run one at a time, the first
+    would wait forever and the budget would expire with no extra link.
+    """
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    extras = [f"C3:EB:49:65:67:{n:02X}" for n in range(3)]
+    started = asyncio.Event()
+    in_flight: set[str] = set()
+
+    async def connect(_hass, address, **_kwargs):
+        if address != PROXY_ADDR:
+            in_flight.add(address)
+            if len(in_flight) == len(extras):
+                started.set()
+            await asyncio.wait_for(started.wait(), 1)
+        client = MagicMock()
+        client.disconnect = AsyncMock()
+        bearer = MagicMock()
+        bearer.start = AsyncMock()
+        bearer.failure = None
+        return client, bearer
+
+    with (
+        _patch_islands(fake, extras),
+        patch.object(
+            coordinator_mod, "async_connect_bearer", new=AsyncMock(side_effect=connect)
+        ),
+    ):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+
+        assert coord.proxy_addresses == [PROXY_ADDR, *extras]
+    await coord.async_stop()
+
+
+async def test_a_slow_late_join_does_not_hold_up_commands(hass) -> None:
+    """The late-join connect runs outside the lock (item 4)."""
+    entry = _all_proxies_entry(hass)
+    fake = FakeController()
+    release = asyncio.Event()
+    real_connect = None
+
+    with _patch_islands(fake, []) as (clients, _, _):
+        coord = MeshCoordinator(hass, entry)
+        await coord.async_start()
+        await coord.async_set_onoff(UNICAST, True)
+        await _started_fanout(coord)
+        real_connect = coordinator_mod.async_connect_bearer.side_effect
+
+        async def slow_connect(hass_, address, **kwargs):
+            if address == OTHER_PROXY_ADDR:
+                await release.wait()
+            return await real_connect(hass_, address, **kwargs)
+
+        coordinator_mod.async_connect_bearer.side_effect = slow_connect
+        coord._on_proxy_seen(OTHER_PROXY_ADDR)
+        await _wait_for(lambda: OTHER_PROXY_ADDR in coord._joining)
+
+        # The join is still connecting; a command must not wait for it.
+        result = await asyncio.wait_for(coord.async_set_onoff(UNICAST, False), 1)
+        assert result is False
+
+        release.set()
+        await _wait_for(lambda: OTHER_PROXY_ADDR in coord.proxy_addresses)
+        assert OTHER_PROXY_ADDR in clients
+    await coord.async_stop()

@@ -421,3 +421,24 @@ def test_find_proxy_addresses_applies_the_stale_advert_rule(hass) -> None:
         return_value=[fresh, stale],
     ):
         assert find_proxy_addresses(hass, NET_KEY) == ["AA:BB:CC:DD:EE:01"]
+
+
+def test_find_proxy_addresses_can_order_by_signal_strength(hass) -> None:
+    """A capped caller keeps the nodes most likely to hold a link."""
+    weak = _fake_info("AA:BB:CC:DD:EE:01", {PROXY_SERVICE: _network_id_advert(NET_KEY)})
+    weak.rssi = -90
+    strong = _fake_info("AA:BB:CC:DD:EE:02", {PROXY_SERVICE: _network_id_advert(NET_KEY)})
+    strong.rssi = -60
+    with patch.object(
+        mesh_transport.bluetooth,
+        "async_discovered_service_info",
+        return_value=[weak, strong],
+    ):
+        assert find_proxy_addresses(hass, NET_KEY) == [
+            "AA:BB:CC:DD:EE:01",
+            "AA:BB:CC:DD:EE:02",
+        ]
+        assert find_proxy_addresses(hass, NET_KEY, strongest_first=True) == [
+            "AA:BB:CC:DD:EE:02",
+            "AA:BB:CC:DD:EE:01",
+        ]
