@@ -13,6 +13,7 @@ from .btmesh.access import HAEFELE_COMPANY_ID
 from .btmesh.network_model import NetworkModelError
 from .const import CONF_INVERTED_CTL, DOMAIN, MODEL_LIGHT_CTL
 from .coordinator import MeshCoordinator
+from .sniffer import MeshSniffer
 
 PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SENSOR]
 
@@ -47,6 +48,11 @@ async def async_setup_entry(
     # retries in the background if no proxy is reachable yet.
     await coordinator.async_start()
     entry.runtime_data = coordinator
+
+    # Read-only log of the mesh traffic the proxies overhear (see sniffer.py).
+    sniffer = MeshSniffer(hass, coordinator)
+    sniffer.async_start()
+    entry.async_on_unload(sniffer.async_stop)
 
     # No config-entry update listener: the options flow is an
     # ``OptionsFlowWithReload`` and reloads the entry itself, and the
