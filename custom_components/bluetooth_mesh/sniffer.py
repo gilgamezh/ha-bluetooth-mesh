@@ -109,6 +109,19 @@ def _ad_structures(data: bytes):
         i += 1 + length
 
 
+def _raw_advert_type(conn) -> type | None:
+    """The raw-advertisement message class this connection already dispatches.
+
+    Taken from the handlers Home Assistant's own scanner registered, so it is
+    the very class the connection keys on, whichever module defines it.
+    """
+    handlers = getattr(conn, "_message_handlers", None) or {}
+    for msg_type in handlers:
+        if getattr(msg_type, "__name__", "") == "BluetoothLERawAdvertisementsResponse":
+            return msg_type
+    return None
+
+
 def _mac(address: int) -> str:
     return ":".join(f"{b:02X}" for b in address.to_bytes(6, "big"))
 
@@ -125,12 +138,13 @@ class MeshSniffer:
         self._attached: dict[str, tuple[Any, Any]] = {}  # entry_id -> (conn, remove)
         self._seen: OrderedDict[tuple[int, int], None] = OrderedDict()
         self._unsub_timer = None
+        self._adverts = self._mesh_ads = self._decoded = 0
 
     @callback
     def async_start(self) -> None:
         self._attach_all()
         self._unsub_timer = async_track_time_interval(
-            self._hass, lambda _now: self._attach_all(), REATTACH_INTERVAL
+            self._hass, self._attach_all, REATTACH_INTERVAL
         )
         _LOGGER.info("mesh sniffer started")
 
@@ -147,12 +161,7 @@ class MeshSniffer:
         self._attached.clear()
 
     @callback
-    def _attach_all(self) -> None:
-        try:
-            from aioesphomeapi.api_pb2 import BluetoothLERawAdvertisementsResponse
-        except ImportError:
-            _LOGGER.warning("mesh sniffer: aioesphomeapi not available")
-            return
+    def _attach_all(self, _now=None) -> None:
         for entry in self._hass.config_entries.async_entries("esphome"):
             data = getattr(entry, "runtime_data", None)
             client = getattr(data, "client", None)
@@ -166,13 +175,18 @@ class MeshSniffer:
                 except Exception:  # noqa: BLE001
                     pass
                 del self._attached[entry.entry_id]
-            if conn is None:
-                continue
-            remove = conn.add_message_callback(
-                self._on_raw_adverts, (BluetoothLERawAdvertisementsResponse,)
-            )
+            msg_type = _raw_advert_type(conn)
+            if msg_type is None:
+                continue  # not connected, or not streaming raw adverts (yet)
+            remove = conn.add_message_callback(self._on_raw_adverts, (msg_type,))
             self._attached[entry.entry_id] = (conn, remove)
             _LOGGER.info("mesh sniffer attached to ESPHome %s", entry.title)
+        if self._adverts:
+            _LOGGER.debug(
+                "mesh sniffer: %d adverts, %d mesh messages, %d decoded since last report",
+                self._adverts, self._mesh_ads, self._decoded,
+            )
+            self._adverts = self._mesh_ads = self._decoded = 0
 
     def _context(self) -> network.NetworkContext:
         if self._app_keys is None:
@@ -190,8 +204,10 @@ class MeshSniffer:
 
     def _on_raw_adverts(self, msg) -> None:
         for adv in msg.advertisements:
+            self._adverts += 1
             for ad_type, payload in _ad_structures(adv.data):
                 if ad_type == AD_TYPE_MESH_MESSAGE:
+                    self._mesh_ads += 1
                     try:
                         self._handle(payload, _mac(adv.address), adv.rssi)
                     except Exception:  # noqa: BLE001 - never break the proxy stream
@@ -202,6 +218,7 @@ class MeshSniffer:
             pdu = network.decode(self._context(), raw)
         except BtMeshError:
             return  # another network, or noise
+        self._decoded += 1
         key = (pdu.src, pdu.seq)
         if key in self._seen:
             return
